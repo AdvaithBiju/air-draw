@@ -5,38 +5,59 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Air Draw</title>
 <style>
-  :root { --ink: #ffdc3c; --good: #78ff78; --bad: #ff5a5a; --panel: rgba(0,0,0,.55); }
+  :root { --ink: #ffdc3c; --good: #78ff78; --bad: #ff5a5a; --panel: rgba(0,0,0,.6); }
   * { box-sizing: border-box; }
-  body { margin: 0; background: #111; color: #fff; font-family: system-ui, "Segoe UI", sans-serif;
+  body { margin: 0; background: #0b0b0f; color: #fff; font-family: system-ui, "Segoe UI", sans-serif;
          height: 100vh; display: grid; place-items: center; overflow: hidden; }
+  body.playing { cursor: none; }
   #stage { position: relative; width: min(100vw, calc(100vh * 16 / 9)); aspect-ratio: 16 / 9; }
-  canvas#view { width: 100%; height: 100%; display: block; background: #000; border-radius: 8px; }
+  canvas#view { width: 100%; height: 100%; display: block; background: #000; }
   video { display: none; }
-  .bar { position: absolute; left: 0; right: 0; background: var(--panel); padding: 14px 24px;
-         display: flex; align-items: center; gap: 16px; }
-  #top { top: 0; border-radius: 8px 8px 0 0; }
-  #bottom { bottom: 0; border-radius: 0 0 8px 8px; justify-content: space-between; font-size: 22px; }
-  #prompt { font-size: 22px; color: #ccc; }
-  #prompt b { color: var(--ink); font-size: 34px; text-transform: uppercase; margin-left: 8px; }
-  #score { margin-left: auto; color: #ccc; font-size: 20px; }
-  #timer { font-size: 34px; font-weight: 700; min-width: 70px; text-align: right; font-variant-numeric: tabular-nums; }
+
+  .bar { position: absolute; left: 0; right: 0; background: var(--panel); padding: 1.2vh 2vw;
+         display: flex; align-items: center; gap: 1.5vw; }
+  #top { top: 0; }
+  #bottom { bottom: 0; justify-content: space-between; font-size: clamp(16px, 2.2vw, 30px); }
+  #round { font-size: clamp(14px, 1.6vw, 22px); color: #bbb; white-space: nowrap; }
+  #prompt { display: flex; align-items: center; gap: 1vw; font-size: clamp(16px, 2vw, 28px); color: #ccc; }
+  #prompt .emoji { font-size: clamp(30px, 4.5vw, 64px); line-height: 1; }
+  #prompt b { color: var(--ink); font-size: clamp(26px, 3.6vw, 52px); text-transform: uppercase; }
+  #dots { display: flex; gap: 6px; margin-left: auto; }
+  #dots span { width: 14px; height: 14px; border-radius: 50%; background: rgba(255,255,255,.2); }
+  #dots span.now { outline: 2px solid #fff; }
+  #dots span.won { background: var(--good); }
+  #dots span.lost { background: var(--bad); }
+  #timer { font-size: clamp(26px, 3.6vw, 52px); font-weight: 800; min-width: 3ch; text-align: right; font-variant-numeric: tabular-nums; }
   #timer.low { color: var(--bad); }
-  #progress { position: absolute; left: 0; bottom: 0; height: 4px; background: #fff; transition: width .1s linear; }
+  #progress { position: absolute; left: 0; bottom: 0; height: 5px; background: #fff; }
   #progress.low { background: var(--bad); }
-  #others { color: #aaa; font-size: 17px; }
-  .overlay { position: absolute; inset: 0; background: rgba(0,0,0,.6); border-radius: 8px;
+  #others { color: #aaa; font-size: .7em; }
+
+  .overlay { position: absolute; inset: 0; background: rgba(0,0,0,.62);
              display: flex; flex-direction: column; align-items: center; justify-content: center;
-             gap: 14px; text-align: center; padding: 16px; }
-  .overlay h1 { margin: 0; font-size: clamp(36px, 7vw, 80px); color: var(--ink); letter-spacing: 2px; }
-  .overlay h2 { margin: 0; font-size: clamp(26px, 4vw, 48px); }
-  .overlay p { margin: 0; font-size: clamp(15px, 1.8vw, 22px); color: #ddd; }
-  button { font: inherit; font-size: 22px; padding: 12px 32px; border-radius: 999px; border: 0;
-           background: var(--good); color: #111; font-weight: 700; cursor: pointer; margin-top: 12px; }
+             gap: 1.6vh; text-align: center; padding: 16px; }
+  .overlay h1 { margin: 0; font-size: clamp(40px, 8vw, 110px); color: var(--ink); letter-spacing: 3px; }
+  .overlay h2 { margin: 0; font-size: clamp(28px, 4.5vw, 64px); }
+  .overlay p { margin: 0; font-size: clamp(15px, 2vw, 28px); color: #ddd; }
+  .rules { display: flex; gap: 4vw; margin: 1.5vh 0; }
+  .rules div { font-size: clamp(14px, 1.8vw, 24px); color: #ddd; }
+  .rules span { display: block; font-size: clamp(40px, 6vw, 84px); }
+  .cta { color: var(--good) !important; font-weight: 700; }
+  button { font: inherit; font-size: clamp(16px, 2vw, 26px); padding: .6em 1.6em; border-radius: 999px; border: 0;
+           background: var(--good); color: #111; font-weight: 700; cursor: pointer; }
   button:disabled { background: #666; cursor: wait; }
-  button.small { font-size: 16px; padding: 8px 16px; margin: 0 0 0 24px; background: rgba(255,255,255,.15); color: #fff; font-weight: 600; }
-  button.small:hover { background: rgba(255,255,255,.28); }
-  kbd { font: 12px ui-monospace, monospace; border: 1px solid rgba(255,255,255,.5); border-radius: 4px; padding: 1px 5px; margin-left: 6px; }
-  .hint { color: #aaa !important; font-size: 15px !important; }
+  .hint { color: #999 !important; font-size: clamp(12px, 1.2vw, 16px) !important; }
+
+  #between .big { font-size: clamp(60px, 10vw, 140px); line-height: 1; }
+  #results { display: grid; grid-template-columns: repeat(5, 1fr); gap: 1.2vw; margin: 2vh 0; }
+  #results div { background: rgba(255,255,255,.08); border-radius: 14px; padding: 1.4vh 1.2vw; min-width: 11vw;
+                 border: 3px solid transparent; }
+  #results div.won { border-color: var(--good); }
+  #results div.lost { border-color: var(--bad); }
+  #results .e { font-size: clamp(32px, 5vw, 72px); display: block; }
+  #results .w { font-size: clamp(14px, 1.6vw, 22px); font-weight: 700; text-transform: capitalize; }
+  #results .d { font-size: clamp(11px, 1.2vw, 16px); color: #bbb; }
+  #finalScore { font-size: clamp(50px, 9vw, 130px); font-weight: 800; color: var(--ink); line-height: 1; }
   [hidden] { display: none !important; }
 </style>
 </head>
@@ -46,10 +67,10 @@
   <canvas id="view" width="1280" height="720"></canvas>
 
   <div id="top" class="bar" hidden>
-    <div id="prompt">Draw:<b id="target"></b></div>
-    <button id="eraseBtn" class="small" title="Erase all (E)">🧽 Erase all <kbd>E</kbd></button>
-    <div id="score"></div>
-    <div id="timer">50s</div>
+    <div id="round">Drawing 1 / 5</div>
+    <div id="prompt">Draw: <span class="emoji" id="emoji"></span><b id="target"></b></div>
+    <div id="dots"></div>
+    <div id="timer">25</div>
     <div id="progress"></div>
   </div>
   <div id="bottom" class="bar" hidden>
@@ -57,19 +78,32 @@
     <div id="others"></div>
   </div>
 
-  <div id="menu" class="overlay">
+  <div id="home" class="overlay">
     <h1>AIR DRAW</h1>
-    <p>I'll tell you what to draw. You have 50 seconds.</p>
-    <p>☝️ Index finger = draw &nbsp;&nbsp; 🖐️ Open palm (5 fingers) = stop</p>
-    <button id="startBtn" disabled>Loading…</button>
-    <p class="hint">SPACE start / next &nbsp;·&nbsp; E erase all</p>
+    <p>Draw 5 things in the air. 25 seconds each. Can the computer guess them?</p>
+    <div class="rules">
+      <div><span>☝️</span>Index finger = draw</div>
+      <div><span>🖐️</span>Open palm = stop</div>
+      <div><span>🧽</span>Fist for 1s = erase all</div>
+    </div>
+    <p class="cta" id="homeCta">Loading…</p>
+    <button id="startBtn" disabled>Start</button>
+    <p class="hint">Stand close to the screen · SPACE start · E erase · F fullscreen</p>
   </div>
 
-  <div id="result" class="overlay" hidden>
-    <h2 id="resultTitle"></h2>
-    <p id="resultMsg"></p>
-    <button id="nextBtn">Next drawing</button>
-    <p class="hint">or press SPACE</p>
+  <div id="between" class="overlay" hidden>
+    <div class="big" id="betweenEmoji"></div>
+    <h2 id="betweenTitle"></h2>
+    <p id="betweenMsg"></p>
+  </div>
+
+  <div id="final" class="overlay" hidden>
+    <p>Your score</p>
+    <div id="finalScore"></div>
+    <p id="finalMsg"></p>
+    <div id="results"></div>
+    <button id="homeBtn">Go to main page</button>
+    <p class="hint" id="homeCountdown"></p>
   </div>
 </div>
 

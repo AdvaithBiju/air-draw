@@ -1,19 +1,40 @@
 import { FilesetResolver, HandLandmarker } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
 import { loadNet } from "./doodle.js";
 
-const ROUND_SECONDS = 50;
+const ROUNDS = 5;
+const ROUND_SECONDS = 25;
+const BETWEEN_MS = 2500;       // "Got it!" / "Time's up" pause between drawings
+const FINAL_RETURN_S = 30;     // score page goes back to the main page by itself
 const WIN_CONFIDENCE = 0.55;   // top guess must be the target with at least this probability
 const GUESS_INTERVAL = 350;    // ms between classifications
 const PEN_UP_GRACE = 3;        // frames a non-draw gesture must last before the pen lifts
+const PALM_HOLD_MS = 1500;     // open palm this long on the main / score page = start / go home
+const FIST_HOLD_MS = 1000;     // fist this long while drawing = erase all
 const INK = "#ffdc3c";
+
+// Crowd handling: several hands are detected, people far behind the player
+// (small hands) are ignored, and the closest hand is followed as the player.
+const MAX_HANDS = 4;
+const MIN_HAND_SIZE = 0.07;    // wrist -> middle knuckle, as a fraction of frame width
+const RIVAL_RATIO = 0.7;       // hands at least this big relative to the biggest stay candidates
 
 // One Euro filter: smooths jitter when the finger moves slowly, follows it with
 // almost no lag when it moves fast. Raise MIN_CUTOFF for less lag, lower it for less jitter.
 const MIN_CUTOFF = 1.5, BETA = 0.012, D_CUTOFF = 1.0;
 
+const EMOJI = {
+  cat: "🐱", apple: "🍎", bicycle: "🚲", bird: "🐦", butterfly: "🦋", car: "🚗", clock: "🕐",
+  cloud: "☁️", cup: "☕", donut: "🍩", eye: "👁️", flower: "🌸", hat: "🎩", ice_cream: "🍦",
+  key: "🔑", ladder: "🪜", light_bulb: "💡", lightning: "⚡", moon: "🌙", mountain: "⛰️",
+  mushroom: "🍄", pizza: "🍕", rainbow: "🌈", smiley_face: "😀", snake: "🐍", spider: "🕷️",
+  star: "⭐", sun: "☀️", sword: "🗡️", tent: "⛺", tree: "🌳", umbrella: "☂️", airplane: "✈️",
+  candle: "🕯️", envelope: "✉️", "t-shirt": "👕", eyeglasses: "👓", headphones: "🎧",
+};
+
 const $ = (id) => document.getElementById(id);
 const video = $("cam"), view = $("view"), ctx = view.getContext("2d");
 const pretty = (label) => label.replace(/_/g, " ");
+const emoji = (label) => EMOJI[label] || "✏️";
 
 // ---------------------------------------------------------------- hand logic
 
@@ -32,7 +53,31 @@ function gesture(lm) {
   const [thumb, index, middle, ring, pinky] = fingersUp(lm);
   if (thumb && index && middle && ring && pinky) return "stop";
   if (index && !middle && !ring && !pinky) return "draw";
+  if (!index && !middle && !ring && !pinky) return "fist";
   return "hover";
+}
+
+let player = null;   // { x, y, at } wrist of the hand we followed last frame
+
+// Choose the player's hand among everything detected.
+function pickPlayerHand(hands, now) {
+  const sized = hands
+    .map((lm) => ({ lm, size: dist(lm[0], lm[9]) }))
+    .filter((h) => h.size >= MIN_HAND_SIZE);
+  if (!sized.length) return null;
+  const biggest = Math.max(...sized.map((h) => h.size));
+  const candidates = sized.filter((h) => h.size >= biggest * RIVAL_RATIO);
+  let pick;
+  if (player && now - player.at < 600) {
+    // stick with the hand closest to where the player's hand just was
+    pick = candidates.reduce((a, b) =>
+      Math.hypot(a.lm[0].x - player.x, a.lm[0].y - player.y) <= Math.hypot(b.lm[0].x - player.x, b.lm[0].y - player.y) ? a : b);
+  } else {
+    pick = candidates.reduce((a, b) => (a.size >= b.size ? a : b));
+  }
+  const jumped = player && Math.hypot(pick.lm[0].x - player.x, pick.lm[0].y - player.y) > 0.25;
+  player = { x: pick.lm[0].x, y: pick.lm[0].y, at: now };
+  return { lm: pick.lm, jumped, others: sized.filter((h) => h !== pick).map((h) => h.lm) };
 }
 
 class OneEuro {
@@ -109,10 +154,99 @@ function guess(strokes) {
 
 // ---------------------------------------------------------------- game state
 
-let state = "menu";          // menu -> playing -> result -> playing ...
-let target = null, strokes = [], guesses = [];
-let startTime = 0, lastGuessTime = 0;
-let cursor = null, penDown = false, notDrawFrames = 0, score = 0, rounds = 0;
+let state = "loading";       // loading -> home -> playing <-> between -> final -> home
+let game = [];               // [{ target, won, time, guess }]
+let round = 0;
+let strokes = [], guesses = [];
+let roundStart = 0, lastGuessTime = 0, stateSince = 0;
+let cursor = null, penDown = false, notDrawFrames = 0;
+let holdGesture = null, holdSince = 0, holdArmed = true;
+
+function show(id, on) { $(id).hidden = !on; }
+
+function setState(s) {
+  state = s;
+  stateSince = performance.now();
+  holdGesture = null;
+  holdArmed = false;          // the palm that triggered this must be lowered first
+  show("home", s === "home");
+  show("between", s === "between");
+  show("final", s === "final");
+  show("top", s === "playing" || s === "between");
+  show("bottom", s === "playing");
+  document.body.classList.toggle("playing", s === "playing" || s === "between");
+}
+
+function goHome() {
+  strokes = []; guesses = [];
+  $("homeCta").textContent = "Hold up an open palm 🖐️ to start";
+  setState("home");
+}
+
+function startGame() {
+  const pool = [...targets];
+  game = [];
+  for (let i = 0; i < ROUNDS; i++) game.push({ target: pool.splice(Math.floor(Math.random() * pool.length), 1)[0] });
+  round = 0;
+  requestWakeLock();
+  startRound();
+}
+
+function startRound() {
+  const r = game[round];
+  strokes = []; guesses = []; penDown = false;
+  roundStart = performance.now();
+  $("round").textContent = `Drawing ${round + 1} / ${ROUNDS}`;
+  $("emoji").textContent = emoji(r.target);
+  $("target").textContent = pretty(r.target);
+  renderDots();
+  renderGuess();
+  setState("playing");
+}
+
+function endRound(won, now) {
+  const r = game[round];
+  r.won = won;
+  r.time = (now - roundStart) / 1000;
+  r.guess = guesses[0] ? guesses[0][0] : null;
+  renderDots();
+  $("betweenEmoji").textContent = won ? emoji(r.target) : "⏰";
+  $("betweenTitle").textContent = won ? `Got it! It's a ${pretty(r.target)}!` : "Time's up!";
+  $("betweenTitle").style.color = won ? "var(--good)" : "var(--bad)";
+  $("betweenMsg").textContent = won
+    ? `Guessed in ${r.time.toFixed(1)}s`
+    : r.guess ? `I thought it was a ${pretty(r.guess)}.` : "Nothing was drawn.";
+  setState("between");
+}
+
+function showFinal() {
+  const score = game.filter((r) => r.won).length;
+  $("finalScore").textContent = `${score} / ${ROUNDS}`;
+  $("finalMsg").textContent = ["Better luck next time!", "Nice try!", "Not bad!", "Good job!", "Great drawing!", "Perfect! You're an artist! 🎨"][score];
+  $("results").innerHTML = game.map((r) => `
+    <div class="${r.won ? "won" : "lost"}">
+      <span class="e">${emoji(r.target)}</span>
+      <span class="w">${pretty(r.target)}</span><br>
+      <span class="d">${r.won ? `✓ ${r.time.toFixed(1)}s` : r.guess ? `✗ saw ${pretty(r.guess)}` : "✗ no drawing"}</span>
+    </div>`).join("");
+  setState("final");
+}
+
+function renderDots() {
+  $("dots").innerHTML = game.map((r, i) =>
+    `<span class="${r.won === true ? "won" : r.won === false ? "lost" : ""} ${i === round && r.won === undefined ? "now" : ""}"></span>`).join("");
+}
+
+function renderGuess() {
+  if (!guesses.length) {
+    $("guess").textContent = "Start drawing with your index finger! ☝️";
+    $("others").textContent = "";
+    return;
+  }
+  const [name, p] = guesses[0];
+  $("guess").textContent = `I see… ${pretty(name)}? (${Math.round(p * 100)}%)`;
+  $("others").textContent = guesses.slice(1).map(([n, q]) => `${pretty(n)} ${Math.round(q * 100)}%`).join(",  ");
+}
 
 function eraseAll() {
   if (state !== "playing") return;
@@ -120,51 +254,14 @@ function eraseAll() {
   renderGuess();
 }
 
-function newRound() {
-  const choices = targets.filter((t) => t !== target);
-  target = choices[Math.floor(Math.random() * choices.length)];
-  strokes = []; guesses = []; penDown = false;
-  startTime = performance.now();
-  rounds++;
-  state = "playing";
-  $("target").textContent = pretty(target);
-  $("score").textContent = `Score ${score}/${rounds}`;
-  $("menu").hidden = $("result").hidden = true;
-  $("top").hidden = $("bottom").hidden = false;
-  renderGuess();
-}
-
-function endRound(won, now) {
-  state = "result";
-  if (won) score++;
-  $("score").textContent = `Score ${score}/${rounds}`;
-  $("bottom").hidden = true;
-  $("result").hidden = false;
-  const title = $("resultTitle");
-  if (won) {
-    title.textContent = `Oh I know, it's a ${pretty(target)}!`;
-    title.style.color = "var(--good)";
-    $("resultMsg").textContent = `Guessed in ${((now - startTime) / 1000).toFixed(1)}s`;
-  } else {
-    title.textContent = "Time's up!";
-    title.style.color = "var(--bad)";
-    const g = guesses[0];
-    $("resultMsg").textContent = g
-      ? `I thought it was a ${pretty(g[0])} (${Math.round(g[1] * 100)}%), not a ${pretty(target)}.`
-      : `You didn't draw anything! It was ${pretty(target)}.`;
-  }
-  $("nextBtn").focus();
-}
-
-function renderGuess() {
-  if (!guesses.length) {
-    $("guess").textContent = "Start drawing with your index finger!";
-    $("others").textContent = "";
-    return;
-  }
-  const [name, p] = guesses[0];
-  $("guess").textContent = `I see… ${pretty(name)}? (${Math.round(p * 100)}%)`;
-  $("others").textContent = guesses.slice(1).map(([n, q]) => `${pretty(n)} ${Math.round(q * 100)}%`).join(",  ");
+// Returns 0..1 progress of the current gesture hold, and fires `action` when it completes.
+function hold(g, wanted, ms, now, action) {
+  if (g !== wanted) { holdGesture = null; holdArmed = true; return 0; }   // released -> can trigger again
+  if (!holdArmed) return 0;
+  if (holdGesture !== wanted) { holdGesture = wanted; holdSince = now; }
+  const p = Math.min(1, (now - holdSince) / ms);
+  if (p >= 1) { holdGesture = null; holdArmed = false; action(); }
+  return p;
 }
 
 // ---------------------------------------------------------------- main loop
@@ -182,24 +279,38 @@ function frame() {
   lastFrameAt = now;
   const w = view.width, h = view.height;
 
-  let g = null;
+  let g = null, others = [];
   const res = landmarker.detectForVideo(video, now);
-  if (res.landmarks && res.landmarks.length) {
-    const lm = res.landmarks[0];
+  const hand = res.landmarks && res.landmarks.length ? pickPlayerHand(res.landmarks, now) : null;
+  if (hand) {
+    const lm = hand.lm;
     g = gesture(lm);
-    // mirrored to match the view
-    cursor = [fx.filter((1 - lm[8].x) * w, now), fy.filter(lm[8].y * h, now)];
+    others = hand.others;
+    if (hand.jumped) { fx.reset(); fy.reset(); penDown = false; }
+    cursor = [fx.filter((1 - lm[8].x) * w, now), fy.filter(lm[8].y * h, now)];   // mirrored
   } else {
     cursor = null;
     fx.reset(); fy.reset();
   }
 
-  if (state === "playing") {
+  let holdProgress = 0;
+  if (state === "home") holdProgress = hold(g, "stop", PALM_HOLD_MS, now, startGame);
+  else if (state === "final") {
+    holdProgress = hold(g, "stop", PALM_HOLD_MS, now, goHome);
+    const left = Math.ceil(FINAL_RETURN_S - (now - stateSince) / 1000);
+    $("homeCountdown").textContent = `Open palm 🖐️ or button to go back · returning automatically in ${left}s`;
+    if (left <= 0) goHome();
+  } else if (state === "between" && now - stateSince > BETWEEN_MS) {
+    round++;
+    if (round < ROUNDS) startRound(); else showFinal();
+  } else if (state === "playing") {
+    holdProgress = hold(g, "fist", FIST_HOLD_MS, now, eraseAll);
+
     // Pen goes down immediately, but only lifts after a few non-draw frames so a
     // one-frame tracking hiccup doesn't break the line. Open palm lifts it at once.
     if (g === "draw" && cursor) notDrawFrames = 0;
     else notDrawFrames++;
-    const drawing = g !== "stop" && notDrawFrames < PEN_UP_GRACE && (penDown || g === "draw");
+    const drawing = g !== "stop" && g !== "fist" && notDrawFrames < PEN_UP_GRACE && (penDown || g === "draw");
     if (drawing && cursor) {
       const pt = [Math.round(cursor[0]), Math.round(cursor[1])];
       if (!penDown) strokes.push([pt]);
@@ -210,6 +321,7 @@ function frame() {
     }
     penDown = drawing;
 
+    const target = game[round].target;
     if (strokes.length && now - lastGuessTime > GUESS_INTERVAL) {
       guesses = guess(strokes);
       lastGuessTime = now;
@@ -217,29 +329,43 @@ function frame() {
       if (guesses.length && guesses[0][0] === target && guesses[0][1] >= WIN_CONFIDENCE) endRound(true, now);
     }
 
-    const remaining = Math.max(0, ROUND_SECONDS - (now - startTime) / 1000);
-    const low = remaining < 10;
-    $("timer").textContent = `${String(Math.ceil(remaining)).padStart(2, "0")}s`;
-    $("timer").classList.toggle("low", low);
-    $("progress").classList.toggle("low", low);
-    $("progress").style.width = `${(remaining / ROUND_SECONDS) * 100}%`;
-    if (state === "playing" && remaining <= 0) {
-      guesses = strokes.length ? guess(strokes) : [];
-      endRound(false, now);
+    if (state === "playing") {
+      const remaining = Math.max(0, ROUND_SECONDS - (now - roundStart) / 1000);
+      const low = remaining < 6;
+      $("timer").textContent = String(Math.ceil(remaining));
+      $("timer").classList.toggle("low", low);
+      $("progress").classList.toggle("low", low);
+      $("progress").style.width = `${(remaining / ROUND_SECONDS) * 100}%`;
+      if (remaining <= 0) {
+        guesses = strokes.length ? guess(strokes) : [];
+        endRound(false, now);
+      }
     }
   }
 
+  render(g, others, holdProgress, w, h);
+}
+
+function render(g, others, holdProgress, w, h) {
   // mirrored camera, dimmed
   ctx.save();
   ctx.translate(w, 0);
   ctx.scale(-1, 1);
   ctx.drawImage(video, 0, 0, w, h);
   ctx.restore();
-  ctx.fillStyle = "rgba(0,0,0,.25)";
+  ctx.fillStyle = "rgba(0,0,0,.3)";
   ctx.fillRect(0, 0, w, h);
 
+  // ignored hands (other people) shown as faint grey dots so it's clear who is playing
+  ctx.fillStyle = "rgba(200,200,200,.35)";
+  for (const lm of others) {
+    ctx.beginPath();
+    ctx.arc((1 - lm[8].x) * w, lm[8].y * h, 6, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
   ctx.strokeStyle = ctx.fillStyle = INK;
-  ctx.lineWidth = 8;
+  ctx.lineWidth = 9;
   ctx.lineCap = ctx.lineJoin = "round";
   for (const s of strokes) {
     ctx.beginPath();
@@ -252,49 +378,83 @@ function frame() {
     ctx.stroke();
   }
 
-  ctx.fillStyle = "rgba(255,255,255,.6)";
-  ctx.font = "16px system-ui";
-  ctx.fillText(`${Math.round(fps)} fps`, 12, h - (state === "playing" ? 80 : 14));
-
   if (cursor) {
     const [cx, cy] = cursor;
     ctx.beginPath();
-    if (g === "draw") {
+    if (g === "draw" && state === "playing") {
       ctx.fillStyle = INK;
-      ctx.arc(cx, cy, 10, 0, Math.PI * 2);
+      ctx.arc(cx, cy, 11, 0, Math.PI * 2);
       ctx.fill();
     } else if (g === "stop") {
       ctx.strokeStyle = ctx.fillStyle = "#ff5a5a";
       ctx.lineWidth = 3;
       ctx.arc(cx, cy, 16, 0, Math.PI * 2);
       ctx.stroke();
-      ctx.font = "bold 24px system-ui";
-      ctx.fillText("STOP", cx + 24, cy + 8);
+      if (state === "playing") { ctx.font = "bold 24px system-ui"; ctx.fillText("STOP", cx + 24, cy + 8); }
     } else {
       ctx.strokeStyle = "#fff";
       ctx.lineWidth = 2;
       ctx.arc(cx, cy, 12, 0, Math.PI * 2);
       ctx.stroke();
     }
+    if (holdProgress > 0) {
+      ctx.beginPath();
+      ctx.strokeStyle = state === "playing" ? "#ffffff" : "#78ff78";
+      ctx.lineWidth = 7;
+      ctx.arc(cx, cy, 34, -Math.PI / 2, -Math.PI / 2 + holdProgress * Math.PI * 2);
+      ctx.stroke();
+    }
   }
+
+  ctx.fillStyle = "rgba(255,255,255,.55)";
+  ctx.font = "15px system-ui";
+  ctx.fillText(`${Math.round(fps)} fps`, 12, h - (state === "playing" ? 90 : 14));
 }
 
-// ---------------------------------------------------------------- startup
+// ---------------------------------------------------------------- kiosk helpers
+
+let wakeLock = null;
+async function requestWakeLock() {
+  try { if ("wakeLock" in navigator && !wakeLock) wakeLock = await navigator.wakeLock.request("screen"); } catch { /* not critical */ }
+  if (wakeLock) wakeLock.addEventListener("release", () => { wakeLock = null; }, { once: true });
+}
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") requestWakeLock(); });
 
 addEventListener("keydown", (e) => {
-  if (e.code === "Space" && predict && state !== "playing") { e.preventDefault(); newRound(); }
+  if (e.code === "Space") {
+    e.preventDefault();
+    if (state === "home") startGame();
+    else if (state === "final") goHome();
+  }
   if (e.code === "KeyE") eraseAll();
+  if (e.code === "KeyF") {
+    if (document.fullscreenElement) document.exitFullscreen();
+    else document.documentElement.requestFullscreen().catch(() => {});
+  }
+  if (e.code === "Escape" && state !== "home" && state !== "loading") goHome();
 });
-$("startBtn").onclick = $("nextBtn").onclick = () => newRound();
-$("eraseBtn").onclick = () => { eraseAll(); $("eraseBtn").blur(); };
+$("startBtn").onclick = () => { $("startBtn").blur(); startGame(); };
+$("homeBtn").onclick = () => { $("homeBtn").blur(); goHome(); };
 
 function scheduleFrame() {
   if ("requestVideoFrameCallback" in video) video.requestVideoFrameCallback(frame);
   else requestAnimationFrame(frame);
 }
 
+// ---------------------------------------------------------------- startup
+
+async function createLandmarker(fileset, delegate) {
+  return HandLandmarker.createFromOptions(fileset, {
+    baseOptions: { modelAssetPath: "hand_landmarker.task", delegate },
+    runningMode: "VIDEO",
+    numHands: MAX_HANDS,
+    minHandDetectionConfidence: 0.6,
+    minHandPresenceConfidence: 0.6,
+    minTrackingConfidence: 0.5,
+  });
+}
+
 async function init() {
-  const btn = $("startBtn");
   try {
     const [meta, weights, stream, fileset] = await Promise.all([
       fetch("model.json").then((r) => r.json()),
@@ -307,22 +467,17 @@ async function init() {
     predict = loadNet(meta.layers, weights);
     labels = meta.labels;
     targets = meta.targets;
-    landmarker = await HandLandmarker.createFromOptions(fileset, {
-      baseOptions: { modelAssetPath: "hand_landmarker.task", delegate: "GPU" },
-      runningMode: "VIDEO",
-      numHands: 1,
-      minHandDetectionConfidence: 0.6,
-      minTrackingConfidence: 0.5,
-    });
+    try { landmarker = await createLandmarker(fileset, "GPU"); }
+    catch { landmarker = await createLandmarker(fileset, "CPU"); }
     video.srcObject = stream;
     await video.play();
-    btn.disabled = false;
-    btn.textContent = "Start";
+    $("startBtn").disabled = false;
+    goHome();
     scheduleFrame();
   } catch (err) {
     console.error(err);
-    btn.textContent = "Error";
-    $("menu").querySelector("p").textContent = `Couldn't start: ${err.message}. Allow camera access and reload.`;
+    $("homeCta").textContent = `Couldn't start: ${err.message}. Allow camera access and reload.`;
+    $("homeCta").style.color = "var(--bad)";
   }
 }
 
