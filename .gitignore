@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+.vercel/
+# re-downloaded automatically by model.py / game.py
+quickdraw_pretrained.bin
+/hand_landmarker.task
